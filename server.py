@@ -1,3 +1,4 @@
+
 """
 Gold Scalper — Combined Server
 - /telegram-webhook  : nhận tin nhắn từ Telegram bot
@@ -68,6 +69,9 @@ def remove_member(user_id):
 # ─── PENDING ORDERS cho MT5 EA ─────────────────────────────
 PENDING_ORDERS: dict = {}
  
+# ─── DEDUP — tránh gửi 2 lần cùng 1 lệnh ──────────────────
+RECENT_ALERTS: dict = {}  # key: "action_entry" → timestamp
+ 
 # ─── TELEGRAM HELPER ───────────────────────────────────────
 async def tg_send(chat_id, text):
     if not bot or not chat_id: return
@@ -76,33 +80,54 @@ async def tg_send(chat_id, text):
     except TelegramError as e:
         print(f"TG error: {e}")
  
-# ─── FORMAT ALERT ──────────────────────────────────────────
+# ─── FORMAT ALERT — theo đúng format V42 ──────────────────
 def format_alert(raw):
-    now = datetime.now().strftime("%H:%M:%S")
+    """
+    Parse và format alert từ V42:
+    Vào lệnh: "🟢 BUY @ 4453.26 | SL 4448.26 | TP 4459.26 | ⭐⭐ 68pts [V18] | 14:55 (VN)"
+    BE:       "⚡ BREAKEVEN | Keo SL ve 4472.18"
+    CutLoss:  "❌ CUT LOSS | Am 100pip | Dong tai 4461.50"
+    Timeout:  "⏳ TIMEOUT | Het 6 nen | Gia 4461.50"
+    """
     is_be  = "BREAKEVEN" in raw
     is_cut = "CUT LOSS"  in raw
     is_to  = "TIMEOUT"   in raw
+    is_dao = "DAO CHIEU" in raw
     is_h1  = "[H1-US]"   in raw
+    is_buy = "BUY @" in raw and not is_dao
+    is_sell = "SELL @" in raw and not is_dao
  
-    if is_be:   header = "⚡ *BREAKEVEN — Keo SL ve hoa von*"
-    elif is_cut: header = "❌ *CAT LENH — Am qua nguong*"
-    elif is_to:  header = "⏳ *HET GIO — Xem xet dong lenh*"
-    elif is_h1:  header = "🔵 *LENH H1 PHIEN MY*"
-    else:        header = ""
+    # Alert quản lý lệnh — giữ nguyên format gốc, thêm gợi ý hành động
+    if is_be:
+        return f"⚡ *BREAKEVEN*\n`{raw}`\n📌 _Keo Stop Loss ve hoa von ngay_"
+    if is_cut:
+        return f"❌ *CAT LENH*\n`{raw}`\n📌 _Dong lenh bang Market Order ngay_"
+    if is_to:
+        return f"⏳ *TIMEOUT*\n`{raw}`\n📌 _Xem xet dong lenh_"
+ 
+    # Alert vào lệnh — giữ nguyên raw, thêm header và gợi ý
+    if is_dao:
+        dir_new = "BUY" if "-> BUY" in raw else "SELL"
+        dir_old = "SELL" if dir_new == "BUY" else "BUY"
+        header = f"🔄 *DAO CHIEU — DONG {dir_old} → {dir_new}*"
+    elif is_h1:
+        header = "🔵 *[H1] LENH PHIEN MY*"
+    elif is_buy:
+        header = "🟢 *BUY — Dat lenh ngay*"
+    elif is_sell:
+        header = "🔴 *SELL — Dat lenh ngay*"
+    else:
+        header = "📊 *Alert*"
  
     hint = ""
-    if "BUY @" in raw and not is_be and not is_cut and not is_to:
-        hint = "📌 _Dat lenh BUY LIMIT theo gia E_"
-    elif "SELL @" in raw and not is_be and not is_cut and not is_to:
-        hint = "📌 _Dat lenh SELL LIMIT theo gia E_"
-    elif is_be:  hint = "📌 _Keo Stop Loss ve hoa von ngay_"
-    elif is_cut: hint = "📌 _Dong lenh Market Order ngay_"
-    elif is_to:  hint = "📌 _Xem xet dong lenh_"
+    if is_buy or (is_dao and "-> BUY" in raw):
+        hint = "📌 _Dat lenh BUY LIMIT theo gia E trong alert_"
+    elif is_sell or (is_dao and "-> SELL" in raw):
+        hint = "📌 _Dat lenh SELL LIMIT theo gia E trong alert_"
  
-    parts = ["━"*28]
-    if header: parts.append(header)
-    parts += [f"`{raw}`", "━"*28, f"🕐 `{now}`"]
-    if hint: parts.append(hint)
+    parts = [header, f"`{raw}`"]
+    if hint:
+        parts.append(hint)
     return "\n".join(parts)
  
 def parse_order(text):
@@ -214,6 +239,21 @@ async def receive_alert(secret: str, request: Request):
         raise HTTPException(status_code=403, detail="Invalid secret")
     raw = (await request.body()).decode("utf-8").strip()
     if not raw: raise HTTPException(status_code=400, detail="Empty")
+ 
+    # Dedup — bỏ qua nếu cùng lệnh trong vòng 60 giây
+    order_check = parse_order(raw)
+    if order_check:
+        dedup_key = f"{order_check['action']}_{order_check['entry']}"
+        now_ts = datetime.now()
+        if dedup_key in RECENT_ALERTS:
+            diff = (now_ts - RECENT_ALERTS[dedup_key]).total_seconds()
+            if diff < 60:
+                return JSONResponse({"status": "duplicate", "skipped": True})
+        RECENT_ALERTS[dedup_key] = now_ts
+        # Dọn dẹp key cũ
+        for k in list(RECENT_ALERTS.keys()):
+            if (now_ts - RECENT_ALERTS[k]).total_seconds() > 120:
+                del RECENT_ALERTS[k]
  
     formatted = format_alert(raw)
     sent = 0
