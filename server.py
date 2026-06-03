@@ -1,4 +1,3 @@
-
 """
 Gold Scalper — Combined Server
 - /telegram-webhook  : nhận tin nhắn từ Telegram bot
@@ -276,14 +275,74 @@ async def receive_alert(secret: str, request: Request):
         order_id = str(uuid.uuid4())[:8].upper()
         PENDING_ORDERS[order_id] = {**order, "order_id": order_id, "ts": datetime.now().isoformat(), "confirmed": False}
  
+        # Log chi tiết để verify khớp với V42
+        log_msg = (
+            f"📋 *LOG LENH #{order_id}*
+"
+            f"Action: `{order['action']}`
+"
+            f"Entry:  `{order['entry']:.2f}`
+"
+            f"SL:     `{order['sl']:.2f}`
+"
+            f"TP:     `{order['tp']:.2f}`
+"
+            f"Source: `{order['source']}`
+"
+            f"Score:  `{order['score']}pts`
+"
+            f"Raw: `{raw[:80]}...`"
+        )
+        await tg_send(ADMIN_ID, log_msg)
+ 
     return JSONResponse({"status": "ok", "sent": sent, "order_id": order_id})
  
 # ─── MT5 EA ENDPOINTS ──────────────────────────────────────
 @app.get("/mt5/pending")
-async def mt5_pending(symbol: str = "XAUUSD"):
+async def mt5_pending(symbol: str = "XAUUSD", current_price: float = 0.0, max_slip: int = 25):
+    """
+    EA gửi kèm current_price + max_slip (pip)
+    Server kiểm tra nếu giá đã chạy > max_slip pip → bỏ qua
+    1 pip vàng = 0.10 USD
+    """
+    MAX_SLIP_USD = max_slip * 0.10
+ 
     for oid, order in PENDING_ORDERS.items():
-        if not order["confirmed"]:
+        if order["confirmed"]:
+            continue
+ 
+        # Nếu EA không gửi current_price thì cứ trả về lệnh
+        if current_price <= 0:
             return JSONResponse(order)
+ 
+        entry  = order["entry"]
+        action = order["action"]
+ 
+        # Tính khoảng cách giá hiện tại so với entry
+        if action == "BUY":
+            # BUY LIMIT: chờ giá giảm về entry
+            # Nếu giá đã tăng lên cao hơn entry + 25pip → bỏ qua
+            dist = current_price - entry
+        else:
+            # SELL LIMIT: chờ giá tăng về entry
+            # Nếu giá đã giảm xuống thấp hơn entry - 25pip → bỏ qua
+            dist = entry - current_price
+ 
+        if dist > MAX_SLIP_USD:
+            # Giá đã chạy xa quá 25 pip → đánh dấu confirmed để bỏ qua
+            order["confirmed"] = True
+            order["skip_reason"] = f"Gia da chay {dist/0.1:.1f} pip > 25 pip"
+            print(f"SKIP order {oid}: {action} @ {entry} | dist={dist/0.1:.1f} pip")
+            await tg_send(ADMIN_ID,
+                f"⏭️ *BO QUA LENH #{oid}*
+"
+                f"{action} @ `{entry:.2f}` | Gia hien tai: `{current_price:.2f}`
+"
+                f"Da chay `{dist/0.1:.1f} pip` > `{max_slip} pip`")
+            continue
+ 
+        return JSONResponse(order)
+ 
     return JSONResponse({})
  
 @app.post("/mt5/confirm")
