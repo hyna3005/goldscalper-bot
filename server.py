@@ -1,41 +1,46 @@
 """
-server.py — Bridge TradingView -> EA MT5
-Deploy len Railway, nhan webhook tu TradingView, luu tin hieu.
-Script poll_railway.py tren may chay MT5 goi GET /pull de lay tin hieu moi.
+server.py — Bridge TradingView -> EA MT5 + Telegram
+Deploy len Railway. 3 file: server.py, requirements.txt, railway.json
 
 Luong:
-  TradingView --POST /webhook--> Railway (server.py) --luu vao RAM-->
-  May ban: poll_railway.py --GET /pull--> lay tin hieu --> ghi file --> EA doc
+  TradingView --POST /webhook--> Railway --luu RAM + gui Telegram-->
+  EA MT5 --WebRequest GET /pull moi 2s--> lay tin hieu --> vao lenh
 """
 
 import os
 import time
 import threading
+import requests as rq
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# Luu tin hieu trong RAM (list cac dong CSV)
-# Railway free restart dinh ky -> mat tin hieu chua pull, nhung voi scalp M5
-# chi can pull moi 2s nen hau nhu khong mat.
+# === CAU HINH TELEGRAM =============================================
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8987222484:AAH4bl-MhtP_DO5-tpMar_yfrvTSEQu4tGg")
+CHAT_ID   = os.environ.get("CHAT_ID", "1877388272")
+TG_URL    = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+# ===================================================================
+
 signals = []
 lock = threading.Lock()
-
 DEFAULT_SYMBOL = "XAUUSD"
 
 
 def next_id():
-    """ID tang dan theo thoi gian (millisecond UTC)."""
     return int(time.time() * 1000)
 
 
+def send_telegram(text):
+    """Gui thong bao Telegram (non-blocking, khong lam cham webhook)."""
+    def _send():
+        try:
+            rq.post(TG_URL, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=5)
+        except Exception as e:
+            print(f"[tg] loi gui: {e}", flush=True)
+    threading.Thread(target=_send, daemon=True).start()
+
+
 def parse_tv_text(text):
-    """
-    Parse message tho tu Pine alert, dang:
-        BUY | ET 3421.5 | SL 3419.2 | TP 3424.9
-    hoac co emoji dau dong.
-    Tra ve (side, et, sl, tp) hoac None.
-    """
     t = text.upper()
     side = None
     if "BUY" in t:
@@ -75,11 +80,9 @@ def parse_tv_text(text):
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """TradingView ban POST vao day."""
     data = request.get_json(silent=True)
     side, et, sl, tp, symbol = None, None, None, None, DEFAULT_SYMBOL
 
-    # Thu parse JSON truoc
     if data and isinstance(data, dict) and all(k in data for k in ("side", "et", "sl", "tp")):
         side = str(data["side"]).upper()
         et = float(data["et"])
@@ -87,7 +90,6 @@ def webhook():
         tp = float(data["tp"])
         symbol = data.get("symbol", DEFAULT_SYMBOL)
     else:
-        # Text tho
         raw = request.get_data(as_text=True)
         parsed = parse_tv_text(raw)
         if parsed:
@@ -96,17 +98,31 @@ def webhook():
     if not side or et is None or sl is None or tp is None:
         return jsonify(ok=False, reason="cannot parse"), 400
 
-    line = f"{next_id()};{side};{et};{sl};{tp};{symbol}"
+    sig_id = next_id()
+    line = f"{sig_id};{side};{et};{sl};{tp};{symbol}"
     with lock:
         signals.append(line)
 
     print(f"[webhook] {line}", flush=True)
+
+    # Gui Telegram
+    emoji = "\U0001f7e2" if side == "BUY" else "\U0001f534"
+    sl_dist = abs(et - sl)
+    tp_dist = abs(tp - et)
+    rr = round(tp_dist / sl_dist, 1) if sl_dist > 0 else 0
+    msg = (
+        f"{emoji} <b>{side} {symbol}</b>\n"
+        f"ET: {et}  |  SL: {sl}  |  TP: {tp}\n"
+        f"SL: {sl_dist:.1f}  |  TP: {tp_dist:.1f}  |  RR: 1:{rr}\n"
+        f"<i>Happy Scalp M5</i>"
+    )
+    send_telegram(msg)
+
     return jsonify(ok=True, line=line), 200
 
 
 @app.route("/pull", methods=["GET"])
 def pull():
-    """Script poll tren may goi GET /pull de lay tin hieu chua xu ly."""
     with lock:
         out = list(signals)
         signals.clear()
@@ -115,7 +131,6 @@ def pull():
 
 @app.route("/", methods=["GET"])
 def health():
-    """Health check cho Railway."""
     with lock:
         pending = len(signals)
     return jsonify(status="running", pending=pending), 200
